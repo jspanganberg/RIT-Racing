@@ -26,38 +26,13 @@ function normalize_path_prefix(string $path): string {
     return '/' . trim($trimmed, '/');
 }
 
-/**
- * Attempt to detect the deployment subdirectory.
- *
- * If the project is served from the web root, this returns ''.
- * If it's served from a subdirectory (e.g. /ritracing), that prefix is returned.
- */
-function detect_base_path(): string {
-    $documentRoot = $_SERVER['DOCUMENT_ROOT'] ?? '';
-    $projectRoot  = realpath(__DIR__ . '/..');
-
-    if ($documentRoot === '' || $projectRoot === false) {
-        return '';
-    }
-
-    $documentRootReal = realpath($documentRoot);
-    if ($documentRootReal === false) {
-        return '';
-    }
-
-    if (strpos($projectRoot, $documentRootReal) !== 0) {
-        return '';
-    }
-
-    $relativePath = substr($projectRoot, strlen($documentRootReal));
-    return normalize_path_prefix($relativePath ?: '');
-}
-
-// Manual override via environment variable, otherwise auto-detect.
+// Keep BASE_PATH explicit and predictable.
+// - Local/root hosting: leave unset => ''
+// - Subdirectory hosting: set env var, e.g. RIT_BASE_PATH=/ritracing
 $configuredBasePath = getenv('RIT_BASE_PATH');
 $basePath = ($configuredBasePath !== false)
     ? normalize_path_prefix($configuredBasePath)
-    : detect_base_path();
+    : '';
 
 define('BASE_PATH', $basePath);
 
