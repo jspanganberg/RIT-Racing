@@ -8,7 +8,58 @@ define('SITE_NAME',     'RIT Racing');
 define('SITE_TAGLINE',  'Kate Gleason College of Engineering');
 define('SITE_URL',      'https://www.ritformula.com'); // update when live
 define('CONTACT_EMAIL', 'formula@rit.edu');
-define('BASE_PATH',     '/ritracing'); // change to '' if deployed at root
+
+/**
+ * Normalize a URL path prefix.
+ *
+ * Examples:
+ * - ''            => ''
+ * - 'ritracing'   => '/ritracing'
+ * - '/ritracing/' => '/ritracing'
+ */
+function normalize_path_prefix(string $path): string {
+    $trimmed = trim($path);
+    if ($trimmed === '' || $trimmed === '/') {
+        return '';
+    }
+
+    return '/' . trim($trimmed, '/');
+}
+
+/**
+ * Attempt to detect the deployment subdirectory.
+ *
+ * If the project is served from the web root, this returns ''.
+ * If it's served from a subdirectory (e.g. /ritracing), that prefix is returned.
+ */
+function detect_base_path(): string {
+    $documentRoot = $_SERVER['DOCUMENT_ROOT'] ?? '';
+    $projectRoot  = realpath(__DIR__ . '/..');
+
+    if ($documentRoot === '' || $projectRoot === false) {
+        return '';
+    }
+
+    $documentRootReal = realpath($documentRoot);
+    if ($documentRootReal === false) {
+        return '';
+    }
+
+    if (strpos($projectRoot, $documentRootReal) !== 0) {
+        return '';
+    }
+
+    $relativePath = substr($projectRoot, strlen($documentRootReal));
+    return normalize_path_prefix($relativePath ?: '');
+}
+
+// Manual override via environment variable, otherwise auto-detect.
+$configuredBasePath = getenv('RIT_BASE_PATH');
+$basePath = ($configuredBasePath !== false)
+    ? normalize_path_prefix($configuredBasePath)
+    : detect_base_path();
+
+define('BASE_PATH', $basePath);
 
 // Social Media
 define('SOCIAL_INSTAGRAM', 'https://www.instagram.com/rit_racing/');
