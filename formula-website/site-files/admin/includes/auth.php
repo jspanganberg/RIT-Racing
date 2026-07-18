@@ -1,0 +1,445 @@
+<?php
+// ============================================================
+//  RIT RACING — Admin Authentication & Utilities
+//
+//  Loaded by every admin page. Provides:
+//    - Session management (login, logout, CSRF protection)
+//    - User account storage (bcrypt hashed, stored under
+//      "password_hash" key in data/users.json)
+//    - upload_image() — validated file upload with chmod fix
+//      NOTE: auto-compression removed in v39. Files are saved
+//      as-is. The _compress_image() function is retained but
+//      no longer called from upload_image().
+//    - resolve_media_image() — copies images between folders
+//    - Helper aliases: auth_require(), auth_name(), csrf_field()
+//
+//  CRITICAL: File permissions
+//    The RIT server saves uploaded files with 0600 (owner-only).
+//    Every file write MUST be followed by chmod($path, 0644)
+//    or the web server cannot serve the file to browsers.
+//
+//  PASSWORD STORAGE:
+//    Passwords stored under "password_hash" key (bcrypt).
+//    login_attempt() reads $user['password_hash'] exclusively.
+//    Records with only a legacy "password" key will fail login
+//    and show a "(reset required)" badge in admin/users.php.
+//
+//  See DEVELOPER_GUIDE.md for full documentation.
+// ============================================================
+
+if (session_status() === PHP_SESSION_NONE) {
+    // Unique session name avoids collisions on shared hosting (people.rit.edu)
+    session_name('RITRACING_ADMIN');
+    session_set_cookie_params([
+        'lifetime' => 0,
+        'path'     => '/',
+        'secure'   => (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off'),
+        'httponly'  => true,
+        'samesite'  => 'Lax',
+    ]);
+    session_start();
+}
+
+// Raise runtime limits (people.rit.edu defaults are very low: 8M memory, 30s timeout)
+@ini_set('memory_limit', '64M');
+@ini_set('max_execution_time', '60');
+
+// Load shared site config (data_load, data_save, asset helpers, etc.)
+require_once '/var/www/html/includes/config.php';
+
+define('USERS_FILE', '/var/www/data/users.json');
+define('UPLOADS_DIR', '/var/www/html/uploads');
+
+// ---------- Basic helpers ----------
+
+function h(string $s): string {
+    return htmlspecialchars($s, ENT_QUOTES, 'UTF-8');
+}
+
+function users_file_exists_and_has_users(): bool {
+    if (!file_exists(USERS_FILE)) return false;
+    $raw = @file_get_contents(USERS_FILE);
+    if ($raw === false) return false;
+    $data = json_decode($raw, true);
+    if (!is_array($data)) return false;
+    return count($data) > 0;
+}
+
+function users_load(): array {
+    if (!file_exists(USERS_FILE)) return [];
+    $raw = @file_get_contents(USERS_FILE);
+    if ($raw === false) return [];
+    $data = json_decode($raw, true);
+    return is_array($data) ? $data : [];
+}
+
+function users_save(array $users): bool {
+    $dir = dirname(USERS_FILE);
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0755, true);
+    }
+    $json = json_encode($users, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    if ($json === false) return false;
+    return file_put_contents(USERS_FILE, $json, LOCK_EX) !== false;
+}
+
+function validate_username(string $u): bool {
+    // letters/numbers/._- , 3–32 chars
+    return (bool)preg_match('/^[A-Za-z0-9_.-]{3,32}$/', $u);
+}
+
+function validate_password(string $p): bool {
+    // minimum 10 chars
+    return strlen($p) >= 10;
+}
+
+function password_hash_safe(string $plain): string {
+    return password_hash($plain, PASSWORD_DEFAULT);
+}
+
+function csrf_token(): string {
+    if (empty($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf_token'];
+}
+
+function csrf_verify(?string $token = null): bool {
+    if (empty($_SESSION['csrf_token'])) return false;
+    if ($token === null) $token = $_POST['csrf_token'] ?? null;
+    if ($token === null) return false;
+    return hash_equals($_SESSION['csrf_token'], $token);
+}
+
+
+// ---------- Flash messages (one request) ----------
+
+function flash_set(string $type, string $message): void {
+    if (empty($_SESSION['_flash'])) {
+        $_SESSION['_flash'] = [];
+    }
+    $_SESSION['_flash'][] = ['type' => $type, 'message' => $message];
+}
+
+function flash_pull(): array {
+    $msgs = $_SESSION['_flash'] ?? [];
+    unset($_SESSION['_flash']);
+    return is_array($msgs) ? $msgs : [];
+}
+
+function csrf_field(): string { return '<input type="hidden" name="csrf_token" value="' . h(csrf_token()) . '">'; }
+
+// ---------- Auth + guards ----------
+
+function is_logged_in(): bool {
+    return !empty($_SESSION['user']);
+}
+
+function current_user(): ?array {
+    return $_SESSION['user'] ?? null;
+}
+
+function require_login(): void {
+    if (!users_file_exists_and_has_users()) {
+        header('Location: setup.php');
+        exit;
+    }
+    if (!is_logged_in()) {
+        header('Location: login.php');
+        exit;
+    }
+}
+
+function login_attempt(string $username, string $password): bool {
+    $users = users_load();
+    foreach ($users as $u) {
+        if (!isset($u['username'], $u['password_hash'])) continue;
+        if (hash_equals($u['username'], $username) && password_verify($password, $u['password_hash'])) {
+            $_SESSION['user'] = [
+                'username' => $u['username'],
+                'role' => $u['role'] ?? 'admin'
+            ];
+            return true;
+        }
+    }
+    return false;
+}
+
+function logout(): void {
+    $_SESSION = [];
+    if (ini_get("session.use_cookies")) {
+        $params = session_get_cookie_params();
+        setcookie(session_name(), '', time() - 42000,
+            $params["path"], $params["domain"],
+            $params["secure"], $params["httponly"]
+        );
+    }
+    session_destroy();
+}
+
+// ---------- Safe image uploads ----------
+
+/**
+ * Upload an image to assets/images/{subfolder}/
+ *
+ * Validates MIME type, builds a safe filename (custom or random),
+ * moves the file, and sets chmod 0644.
+ * Auto-compression is NOT applied — files are saved exactly as uploaded.
+ * To compress, use the Cropper.js tool in the Media Library before uploading,
+ * or manually compress with squoosh.app / tinypng.com before selecting files.
+ *
+ * @param  array  $file       Single $_FILES entry
+ * @param  string $subfolder  Target subfolder under assets/images/
+ * @param  string $custom_name  Optional filename (without extension)
+ * @return array  ['ok'=>bool, 'error'=>string, 'filename'=>string]
+ */
+function upload_image(array $file, string $subfolder = 'uploads', string $custom_name = ''): array {
+
+    if (!isset($file['error']) || is_array($file['error'])) {
+        return ['ok' => false, 'error' => 'Invalid upload.', 'filename' => ''];
+    }
+    if ($file['error'] !== UPLOAD_ERR_OK) {
+        // Translate common upload error codes
+        $err_map = [
+            UPLOAD_ERR_INI_SIZE   => 'File exceeds server upload limit (' . ini_get('upload_max_filesize') . ').',
+            UPLOAD_ERR_FORM_SIZE  => 'File exceeds form upload limit.',
+            UPLOAD_ERR_PARTIAL    => 'Upload was interrupted.',
+            UPLOAD_ERR_NO_FILE    => 'No file was selected.',
+            UPLOAD_ERR_NO_TMP_DIR => 'Server missing temp directory.',
+            UPLOAD_ERR_CANT_WRITE => 'Server cannot write to disk.',
+        ];
+        $msg = $err_map[$file['error']] ?? ('Upload failed (code ' . $file['error'] . ').');
+        return ['ok' => false, 'error' => $msg, 'filename' => ''];
+    }
+
+    // Limit size
+    $maxBytes = 4 * 1024 * 1024; // 4 MB
+    if ($file['size'] > $maxBytes) {
+        return ['ok' => false, 'error' => 'File too large (max 4 MB).', 'filename' => ''];
+    }
+
+    // Only allow common raster formats (NO SVG)
+    $allowedMime = [
+        'image/jpeg' => 'jpg',
+        'image/png'  => 'png',
+        'image/gif'  => 'gif',
+        'image/webp' => 'webp',
+    ];
+
+    // Detect MIME type — prefer fileinfo extension, fall back to file extension
+    $mime = false;
+    if (function_exists('finfo_open')) {
+        $finfo = finfo_open(FILEINFO_MIME_TYPE);
+        if ($finfo !== false) {
+            $mime = finfo_file($finfo, $file['tmp_name']);
+            finfo_close($finfo);
+        }
+    }
+
+    // Fallback: use the file extension if fileinfo is unavailable
+    if ($mime === false) {
+        $ext_map = [
+            'jpg'  => 'image/jpeg',
+            'jpeg' => 'image/jpeg',
+            'png'  => 'image/png',
+            'gif'  => 'image/gif',
+            'webp' => 'image/webp',
+        ];
+        $ext_raw = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+        $mime = $ext_map[$ext_raw] ?? 'unknown';
+    }
+
+    if (!isset($allowedMime[$mime])) {
+        return ['ok' => false, 'error' => 'Unsupported image type (' . $mime . ').', 'filename' => ''];
+    }
+
+    // Build destination path: assets/images/{subfolder}/
+    $subfolder = preg_replace('/[^a-zA-Z0-9\/\-_]/', '', $subfolder);
+    $destDir   = dirname(dirname(__DIR__)) . '/assets/images/' . $subfolder;
+    if (!is_dir($destDir)) {
+        if (!@mkdir($destDir, 0755, true)) {
+            return ['ok' => false, 'error' => 'Cannot create folder: images/' . $subfolder . '/. Check permissions.', 'filename' => ''];
+        }
+    }
+    if (!is_writable($destDir)) {
+        return ['ok' => false, 'error' => 'Folder images/' . $subfolder . '/ is not writable. Run: chmod 755 on it via SSH.', 'filename' => ''];
+    }
+
+    $ext = $allowedMime[$mime];
+
+    // Use custom name if provided, otherwise generate random name
+    // 270: Determine the base name to use (custom input vs. original device name)
+    $nameToUse = ($custom_name !== '') ? $custom_name : $file['name'];
+
+    // 272: Sanitize the name: remove extension, keep only safe chars, replace others with nothing
+    $safe = preg_replace('/[^a-zA-Z0-9_\-]/', '', pathinfo($nameToUse, PATHINFO_FILENAME));
+
+    // 273: Fallback if sanitization results in an empty string (e.g., if filename was just emojis)
+    if ($safe === '') $safe = 'image';
+
+    $filename = $safe . '.' . $ext;
+
+    // 275: If a file with this name already exists, append a counter (e.g., photo-1.jpg)
+    $counter = 1;
+    while (file_exists($destDir . '/' . $filename)) {
+        $filename = $safe . '-' . $counter . '.' . $ext;
+        $counter++;
+    }
+//    if ($custom_name !== '') {
+//        $safe = preg_replace('/[^a-zA-Z0-9_\-]/', '', pathinfo($custom_name, PATHINFO_FILENAME));
+//        if ($safe === '') $safe = 'image';
+//        $filename = $safe . '.' . $ext;
+//        // If file already exists, append a number
+//        $counter = 1;
+//        while (file_exists($destDir . '/' . $filename)) {
+//            $filename = $safe . '-' . $counter . '.' . $ext;
+//            $counter++;
+//        }
+//    } else {
+//        $filename = bin2hex(random_bytes(16)) . '.' . $ext;
+//    }
+
+    $destPath = $destDir . '/' . $filename;
+
+    if (!move_uploaded_file($file['tmp_name'], $destPath)) {
+        return ['ok' => false, 'error' => 'Could not save upload. Check folder permissions on images/' . $subfolder . '/.', 'filename' => ''];
+    }
+
+    // Make file readable by the web server (uploaded files default to 0600 on many servers)
+    @chmod($destPath, 0644);
+
+    return ['ok' => true, 'error' => '', 'filename' => $filename];
+}
+
+/**
+ * Compress and resize an image in-place.
+ *
+ * NOTE: This function is no longer called automatically from upload_image()
+ * as of v39. It is retained here for optional manual use if compression
+ * is re-enabled in the future. Call it explicitly after upload_image() if needed.
+ *
+ * When called:
+ * - Resizes to max 2560px wide (retina-friendly, preserves aspect ratio)
+ * - JPEG: 92% quality
+ * - PNG: light compression (level 4)
+ * - WebP: 90% quality
+ * - GIF: skipped (animation would be lost)
+ * - Files under 150KB: skipped (already small enough)
+ * - Fails silently — original file is kept if anything goes wrong
+ */
+function _compress_image(string $path, string $mime): void {
+    try {
+        if ($mime === 'image/gif') return;
+        if (filesize($path) < 150 * 1024) return; // Skip files already under 150KB
+
+        $maxWidth = 2560;
+
+        // Load image based on type
+        switch ($mime) {
+            case 'image/jpeg':
+                $img = @imagecreatefromjpeg($path);
+                break;
+            case 'image/png':
+                $img = @imagecreatefrompng($path);
+                break;
+            case 'image/webp':
+                if (function_exists('imagecreatefromwebp')) {
+                    $img = @imagecreatefromwebp($path);
+                } else {
+                    return; // WebP not supported by this GD build
+                }
+                break;
+            default:
+                return;
+        }
+
+        if (!$img) return; // Failed to load — keep original
+
+        $origW = imagesx($img);
+        $origH = imagesy($img);
+
+        // Resize if wider than max
+        if ($origW > $maxWidth) {
+            $newW = $maxWidth;
+            $newH = (int) round($origH * ($maxWidth / $origW));
+            $resized = imagecreatetruecolor($newW, $newH);
+
+            // Preserve transparency for PNG/WebP
+            if ($mime === 'image/png' || $mime === 'image/webp') {
+                imagealphablending($resized, false);
+                imagesavealpha($resized, true);
+                $transparent = imagecolorallocatealpha($resized, 0, 0, 0, 127);
+                imagefill($resized, 0, 0, $transparent);
+            }
+
+            imagecopyresampled($resized, $img, 0, 0, 0, 0, $newW, $newH, $origW, $origH);
+            imagedestroy($img);
+            $img = $resized;
+        }
+
+        // Save compressed version over original
+        switch ($mime) {
+            case 'image/jpeg':
+                imagejpeg($img, $path, 92);
+                break;
+            case 'image/png':
+                imagepng($img, $path, 4);
+                break;
+            case 'image/webp':
+                imagewebp($img, $path, 90);
+                break;
+        }
+
+        imagedestroy($img);
+        @chmod($path, 0644);
+
+    } catch (\Throwable $e) {
+        // Compression failed — original file is untouched, no harm done
+        return;
+    }
+}
+
+
+// ---------- Backwards-compatible helpers (existing admin pages) ----------
+
+function auth_require(): void { require_login(); }
+function auth_user(): ?array { return current_user(); }
+function auth_name(): string { $u = current_user(); return $u['username'] ?? ''; }
+function auth_role(): string { $u = current_user(); return $u['role'] ?? ''; }
+function auth_is_admin(): bool { return auth_role() === 'admin'; }
+function auth_logout(): void { logout(); }
+
+/**
+ * Ensure an image file exists in the target subfolder.
+ * If it's not there, search all image folders and copy it.
+ * Returns the filename if found/copied, or empty string if not found anywhere.
+ */
+function resolve_media_image(string $filename, string $target_subfolder): string {
+    if (!$filename) return '';
+    
+    $base = dirname(dirname(__DIR__)) . '/assets/images/';
+    $target_dir = $base . $target_subfolder . '/';
+    
+    // Already in the right place?
+    if (file_exists($target_dir . $filename)) {
+        return $filename;
+    }
+    
+    // Search all image subfolders
+    $search_dirs = ['uploads','site','team','sponsors','cars/electric','cars/combustion','memorial','programs'];
+    foreach ($search_dirs as $sub) {
+        $src = $base . $sub . '/' . $filename;
+        if (file_exists($src)) {
+            // Ensure target directory exists
+            if (!is_dir($target_dir)) @mkdir($target_dir, 0755, true);
+            // Copy to target folder
+            if (@copy($src, $target_dir . $filename)) {
+                @chmod($target_dir . $filename, 0644);
+                return $filename;
+            }
+        }
+    }
+    
+    // Not found anywhere
+    return $filename; // Return as-is, will show placeholder on public page
+}

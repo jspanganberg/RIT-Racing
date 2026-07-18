@@ -1,0 +1,10 @@
+# RIT Racing — robots.txt
+User-agent: *
+Allow: /
+
+Sitemap: https://ritformula.com/sitemap.xml
+
+# Block admin and data directories
+Disallow: /admin/
+Disallow: /data/
+Disallow: /includes/
